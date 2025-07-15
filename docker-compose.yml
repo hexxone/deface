@@ -1,0 +1,8 @@
+version: '3.8'
+services:
+  deface:
+    build: .
+    volumes:
+      - ./examples:/app/examples
+      - ./output:/app/output
+    command: deface ./examples -o ./output

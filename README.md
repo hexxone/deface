@@ -232,3 +232,19 @@ The face bounding boxes predicted by the CenterFace detector are then used as ma
   [released under MIT license](https://github.com/Star-Clouds/CenterFace/blob/36afed/LICENSE)
 - The included model file `centerface.onnx` is an unmodified copy of the [`centerface_bnmerged.onnx`](https://github.com/Star-Clouds/CenterFace/blob/b82ec0c4844e89fd5a0305986aed9bdf33c72585/models/onnx/centerface_bnmerged.onnx) from https://github.com/Star-Clouds/centerface
 - The original source of the example images in the `examples` directory can be found [here](https://www.pexels.com/de-de/foto/stadt-kreuzung-strasse-menschen-109919/) (released under the [Pexels photo license](https://www.pexels.com/photo-license/))
+
+## Docker Usage
+
+To run the application using Docker, first build the image:
+
+```bash
+docker-compose build
+```
+
+Then, you can run the application with the following command:
+
+```bash
+docker-compose up
+```
+
+This will process all the files in the `examples` directory and save the output to the `output` directory. You can change the input and output directories by modifying the `docker-compose.yml` file.
