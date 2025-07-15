@@ -16,6 +16,7 @@ import cv2
 
 from deface import __version__
 from deface.centerface import CenterFace
+from deface.track import Tracker
 
 
 def scale_bb(x1, y1, x2, y2, mask_scale=1.0):
@@ -118,7 +119,8 @@ def video_detect(
         replaceimg = None,
         keep_audio: bool = False,
         mosaicsize: int = 20,
-        disable_progress_output = False
+        disable_progress_output = False,
+        unstable: bool = False
 ):
     try:
         if 'fps' in ffmpeg_config:
@@ -158,15 +160,27 @@ def video_detect(
             opath, format='FFMPEG', mode='I', **_ffmpeg_config
         )
 
+    tracker = Tracker(max_age=30, min_hits=3, iou_threshold=0.3)
     for frame in read_iter:
         # Perform network inference, get bb dets but discard landmark predictions
         dets, _ = centerface(frame, threshold=threshold)
 
-        anonymize_frame(
-            dets, frame, mask_scale=mask_scale,
-            replacewith=replacewith, ellipse=ellipse, draw_scores=draw_scores,
-            replaceimg=replaceimg, mosaicsize=mosaicsize
-        )
+        if unstable:
+            anonymize_frame(
+                dets, frame, mask_scale=mask_scale,
+                replacewith=replacewith, ellipse=ellipse, draw_scores=draw_scores,
+                replaceimg=replaceimg, mosaicsize=mosaicsize
+            )
+        else:
+            # Update tracker
+            track_bbs_ids = tracker.update(dets)
+            # Anonymize using tracked bbs
+            anonymize_frame(
+                track_bbs_ids, frame, mask_scale=mask_scale,
+                replacewith=replacewith, ellipse=ellipse, draw_scores=draw_scores,
+                replaceimg=replaceimg, mosaicsize=mosaicsize
+            )
+
 
         if opath is not None:
             writer.append_data(frame)
@@ -322,6 +336,9 @@ def parse_cli_args():
         '--version', action='version', version=__version__,
         help='Print version number and exit.')
     parser.add_argument(
+        '--unstable', default=False, action='store_true',
+        help='Disable tracking and use unstable frame-by-frame detection.')
+    parser.add_argument(
         '--keep-metadata', '-m', default=False, action='store_true',
         help='Keep metadata of the original image. Default : False.')
     parser.add_argument('--help', '-h', action='help', help='Show this help message and exit.')
@@ -371,6 +388,7 @@ def main():
     keep_metadata = args.keep_metadata
     replaceimg = None
     disable_progress_output = args.disable_progress_output
+    unstable = args.unstable
 
     if in_shape is not None:
         w, h = in_shape.split('x')
@@ -417,7 +435,8 @@ def main():
                 ffmpeg_config=ffmpeg_config,
                 replaceimg=replaceimg,
                 mosaicsize=mosaicsize,
-                disable_progress_output=disable_progress_output
+                disable_progress_output=disable_progress_output,
+                unstable=unstable
             )
         elif filetype == 'image':
             image_detect(
