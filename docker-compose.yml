@@ -5,4 +5,4 @@ services:
     volumes:
       - ./examples:/app/examples
       - ./output:/app/output
-    command: deface ./examples -o ./output
+    command: deface ./examples/city.mp4 -o ./output/city_anonymized.mp4

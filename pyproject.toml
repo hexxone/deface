@@ -23,7 +23,8 @@ dependencies = [
     "tqdm",
     "scikit-image",
     "opencv-python",
-    "filterpy"
+    "filterpy",
+    "scipy"
 ]
 
 [project.optional-dependencies]
