@@ -44,6 +44,11 @@ class Track:
         self.hits = 0
         self.hit_streak = 0
         self.age = 0
+        self.smoothing_buffer = []
+        self.smoothing_window = 5
+        self.fade_in = 5
+        self.fade_out = 5
+        self.alpha = 0
 
     def convert_bbox_to_z(self, bbox):
         """
@@ -92,7 +97,20 @@ class Track:
         if self.time_since_update > 0:
             self.hit_streak = 0
         self.time_since_update += 1
-        self.history.append(self.convert_x_to_bbox(self.kf.x))
+
+        if self.time_since_update > 0:
+            self.alpha = max(0, 1 - self.time_since_update / self.fade_out)
+        else:
+            self.alpha = min(1, self.age / self.fade_in)
+
+        bbox = self.convert_x_to_bbox(self.kf.x)
+        self.smoothing_buffer.append(bbox)
+        # Average over the last frames
+        if len(self.smoothing_buffer) > self.smoothing_window:
+            self.smoothing_buffer.pop(0)
+
+        smoothed_bbox = np.mean(self.smoothing_buffer, axis=0)
+        self.history.append(np.append(smoothed_bbox, self.alpha))
         return self.history[-1]
 
 
@@ -100,10 +118,13 @@ class Tracker:
     """
     This class is the main tracker class.
     """
-    def __init__(self, max_age=1, min_hits=3, iou_threshold=0.3):
+    def __init__(self, max_age=1, min_hits=3, iou_threshold=0.3, smoothing_window=5, fade_in=5, fade_out=5):
         self.max_age = max_age
         self.min_hits = min_hits
         self.iou_threshold = iou_threshold
+        self.smoothing_window = smoothing_window
+        self.fade_in = fade_in
+        self.fade_out = fade_out
         self.trackers = []
         self.frame_count = 0
         self.next_id = 0
@@ -119,7 +140,7 @@ class Tracker:
         to_del = []
         ret = []
         for t, trk in enumerate(trks):
-            pos = self.trackers[t].predict()[0]
+            pos = self.trackers[t].predict()
             trk[:] = [pos[0], pos[1], pos[2], pos[3], 0]
             if np.any(np.isnan(pos)):
                 to_del.append(t)
@@ -138,6 +159,9 @@ class Tracker:
         for i in unmatched_dets:
             trk = Track(dets[i, :], self.next_id)
             self.next_id += 1
+            trk.smoothing_window = self.smoothing_window
+            trk.fade_in = self.fade_in
+            trk.fade_out = self.fade_out
             self.trackers.append(trk)
         i = len(self.trackers)
         for trk in reversed(self.trackers):

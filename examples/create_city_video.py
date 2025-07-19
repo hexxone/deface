@@ -1,7 +1,7 @@
 import cv2
 import numpy as np
 
-img = cv2.imread('examples/city.jpg')
+img = cv2.imread('examples/original/city.jpg')
 height, width, layers = img.shape
 size = (width,height)
 

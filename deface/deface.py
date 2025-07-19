@@ -36,7 +36,9 @@ def draw_det(
         draw_scores: bool = False,
         ovcolor: Tuple[int] = (0, 0, 0),
         replaceimg = None,
-        mosaicsize: int = 20
+        mosaicsize: int = 20,
+        feathering: float = 0.1,
+        alpha: float = 1.0
 ):
     if replacewith == 'solid':
         cv2.rectangle(frame, (x1, y1), (x2, y2), ovcolor, -1)
@@ -50,7 +52,16 @@ def draw_det(
             roibox = frame[y1:y2, x1:x2]
             # Get y and x coordinate lists of the "bounding ellipse"
             ey, ex = skimage.draw.ellipse((y2 - y1) // 2, (x2 - x1) // 2, (y2 - y1) // 2, (x2 - x1) // 2)
-            roibox[ey, ex] = blurred_box[ey, ex]
+
+            # Create a feathered mask
+            mask = np.zeros_like(roibox, dtype=float)
+            mask[ey, ex] = 1.0
+            mask = cv2.GaussianBlur(mask, (0, 0), sigmaX=(x2 - x1) * feathering, sigmaY=(y2 - y1) * feathering)
+
+            # Apply alpha for fading
+            mask *= alpha
+
+            roibox = roibox * (1 - mask) + blurred_box * mask
             frame[y1:y2, x1:x2] = roibox
         else:
             frame[y1:y2, x1:x2] = blurred_box
@@ -79,10 +90,11 @@ def draw_det(
 
 def anonymize_frame(
         dets, frame, mask_scale,
-        replacewith, ellipse, draw_scores, replaceimg, mosaicsize
+        replacewith, ellipse, draw_scores, replaceimg, mosaicsize, feathering
 ):
     for i, det in enumerate(dets):
         boxes, score = det[:4], det[4]
+        alpha = det[5] if len(det) > 5 else 1
         x1, y1, x2, y2 = boxes.astype(int)
         x1, y1, x2, y2 = scale_bb(x1, y1, x2, y2, mask_scale)
         # Clip bb coordinates to valid frame region
@@ -94,7 +106,9 @@ def anonymize_frame(
             ellipse=ellipse,
             draw_scores=draw_scores,
             replaceimg=replaceimg,
-            mosaicsize=mosaicsize
+            mosaicsize=mosaicsize,
+            feathering=feathering,
+            alpha=alpha
         )
 
 
@@ -120,7 +134,14 @@ def video_detect(
         keep_audio: bool = False,
         mosaicsize: int = 20,
         disable_progress_output = False,
-        unstable: bool = False
+        unstable: bool = False,
+        smoothing_window: int = 5,
+        feathering: float = 0.1,
+        fade_in: int = 5,
+        fade_out: int = 5,
+        max_age: int = 30,
+        min_hits: int = 2,
+        iou_threshold: float = 0.5
 ):
     try:
         if 'fps' in ffmpeg_config:
@@ -160,7 +181,11 @@ def video_detect(
             opath, format='FFMPEG', mode='I', **_ffmpeg_config
         )
 
-    tracker = Tracker(max_age=30, min_hits=2, iou_threshold=0.5)
+    tracker = Tracker(
+        max_age=max_age, min_hits=min_hits, iou_threshold=iou_threshold,
+        smoothing_window=smoothing_window,
+        fade_in=fade_in, fade_out=fade_out
+    )
     for frame in read_iter:
         # Perform network inference, get bb dets but discard landmark predictions
         dets, _ = centerface(frame, threshold=threshold)
@@ -169,7 +194,7 @@ def video_detect(
             anonymize_frame(
                 dets, frame, mask_scale=mask_scale,
                 replacewith=replacewith, ellipse=ellipse, draw_scores=draw_scores,
-                replaceimg=replaceimg, mosaicsize=mosaicsize
+                replaceimg=replaceimg, mosaicsize=mosaicsize, feathering=feathering
             )
         else:
             # Update tracker
@@ -178,7 +203,7 @@ def video_detect(
             anonymize_frame(
                 track_bbs_ids, frame, mask_scale=mask_scale,
                 replacewith=replacewith, ellipse=ellipse, draw_scores=draw_scores,
-                replaceimg=replaceimg, mosaicsize=mosaicsize
+                replaceimg=replaceimg, mosaicsize=mosaicsize, feathering=feathering
             )
 
 
@@ -210,6 +235,7 @@ def image_detect(
         keep_metadata: bool,
         replaceimg = None,
         mosaicsize: int = 20,
+        feathering: float = 0.1
 ):
     frame = iio.imread(ipath)
 
@@ -224,7 +250,7 @@ def image_detect(
     anonymize_frame(
         dets, frame, mask_scale=mask_scale,
         replacewith=replacewith, ellipse=ellipse, draw_scores=draw_scores,
-        replaceimg=replaceimg, mosaicsize=mosaicsize
+        replaceimg=replaceimg, mosaicsize=mosaicsize, feathering=feathering
     )
 
     if enable_preview:
@@ -339,6 +365,27 @@ def parse_cli_args():
         '--unstable', default=False, action='store_true',
         help='Disable tracking and use unstable frame-by-frame detection.')
     parser.add_argument(
+        '--smoothing-window', default=5, type=int,
+        help='Size of the smoothing window for bounding box tracking. Default: 5.')
+    parser.add_argument(
+        '--feathering', default=0.1, type=float,
+        help='Feathering amount for smooth mask borders. Default: 0.1.')
+    parser.add_argument(
+        '--fade-in', default=5, type=int,
+        help='Number of frames to fade in the mask. Default: 5.')
+    parser.add_argument(
+        '--fade-out', default=5, type=int,
+        help='Number of frames to fade out the mask. Default: 5.')
+    parser.add_argument(
+        '--max-age', default=30, type=int,
+        help='Maximum number of frames to keep a track without a detection. Default: 30.')
+    parser.add_argument(
+        '--min-hits', default=2, type=int,
+        help='Minimum number of hits to start a track. Default: 2.')
+    parser.add_argument(
+        '--iou-threshold', default=0.5, type=float,
+        help='IOU threshold for matching detections to tracks. Default: 0.5.')
+    parser.add_argument(
         '--keep-metadata', '-m', default=True, action='store_true',
         help='Keep metadata of the original image. Default : True.')
     parser.add_argument('--help', '-h', action='help', help='Show this help message and exit.')
@@ -389,6 +436,13 @@ def main():
     replaceimg = None
     disable_progress_output = args.disable_progress_output
     unstable = args.unstable
+    smoothing_window = args.smoothing_window
+    feathering = args.feathering
+    fade_in = args.fade_in
+    fade_out = args.fade_out
+    max_age = args.max_age
+    min_hits = args.min_hits
+    iou_threshold = args.iou_threshold
 
     if in_shape is not None:
         w, h = in_shape.split('x')
@@ -415,6 +469,11 @@ def main():
         if opath is None and not is_cam:
             root, ext = os.path.splitext(ipath)
             opath = f'{root}_anonymized{ext}'
+        elif opath is not None and os.path.isdir(opath):
+            os.makedirs(opath, exist_ok=True)
+            root, ext = os.path.splitext(os.path.basename(ipath))
+            opath = os.path.join(opath, f'{root}_anonymized{ext}')
+
         print(f'Input:  {ipath}\nOutput: {opath}')
         if opath is None and not enable_preview:
             print('No output file is specified and the preview GUI is disabled. No output will be produced.')
@@ -436,7 +495,14 @@ def main():
                 replaceimg=replaceimg,
                 mosaicsize=mosaicsize,
                 disable_progress_output=disable_progress_output,
-                unstable=unstable
+                unstable=unstable,
+                smoothing_window=smoothing_window,
+                feathering=feathering,
+                fade_in=fade_in,
+                fade_out=fade_out,
+                max_age=max_age,
+                min_hits=min_hits,
+                iou_threshold=iou_threshold
             )
         elif filetype == 'image':
             image_detect(
@@ -451,7 +517,8 @@ def main():
                 enable_preview=enable_preview,
                 keep_metadata=keep_metadata,
                 replaceimg=replaceimg,
-                mosaicsize=mosaicsize
+                mosaicsize=mosaicsize,
+                feathering=feathering
             )
         elif filetype is None:
             print(f'Can\'t determine file type of file {ipath}. Skipping...')
