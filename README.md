@@ -9,8 +9,16 @@ By default all audio tracks are discarded as well.
 
 Original frame | `deface` output (using default options)
 :--:|:--:
-![examples/city.jpg](examples/city.jpg) | ![$ deface examples/city.jpg](examples/city_anonymized.jpg)
+![examples/city.jpg](examples/original/city.jpg) | ![$ deface examples/city.jpg](examples/city_anonymized.jpg)
 
+## TODOs
+
+- Add better time- and movement-smoothing
+- Try to make the mask border have a smooth falloff/border instead of a hard cut
+- Try to fade the mask in & out slowly over some frames before and after the actual detection instead of popping in & out
+  - maybe also animate the size to fade in/out in conjunction with the mask opacity
+- Make every "Video Tracker" setting available as CLI option
+- Change "output" cli option to be a directory instead of file.
 
 ## Installation
 
@@ -122,7 +130,7 @@ optional arguments:
 
 ## Usage examples
 
-In most use cases the default configuration should be sufficient, but depending on individual requirements and type of media to be processed, some of the options might need to be adjusted. In this section, some common example scenarios that require option changes are presented. All of the examples use the photo [examples/city.jpg](examples/city.jpg), but they work the same on any video or photo file.
+In most use cases the default configuration should be sufficient, but depending on individual requirements and type of media to be processed, some of the options might need to be adjusted. In this section, some common example scenarios that require option changes are presented. All of the examples use the photo [examples/city.jpg](examples/original/city.jpg), but they work the same on any video or photo file.
 
 ### Drawing black boxes
 
@@ -235,16 +243,8 @@ The face bounding boxes predicted by the CenterFace detector are then used as ma
 
 ## Docker Usage
 
-To run the application using Docker, first build the image:
-
 ```bash
-docker-compose build
-```
-
-Then, you can run the application with the following command:
-
-```bash
-docker-compose up
+docker-compose up --build
 ```
 
 This will process all the files in the `examples` directory and save the output to the `output` directory. You can change the input and output directories by modifying the `docker-compose.yml` file.

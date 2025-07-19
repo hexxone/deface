@@ -160,7 +160,7 @@ def video_detect(
             opath, format='FFMPEG', mode='I', **_ffmpeg_config
         )
 
-    tracker = Tracker(max_age=30, min_hits=3, iou_threshold=0.3)
+    tracker = Tracker(max_age=30, min_hits=2, iou_threshold=0.5)
     for frame in read_iter:
         # Perform network inference, get bb dets but discard landmark predictions
         dets, _ = centerface(frame, threshold=threshold)
@@ -339,8 +339,8 @@ def parse_cli_args():
         '--unstable', default=False, action='store_true',
         help='Disable tracking and use unstable frame-by-frame detection.')
     parser.add_argument(
-        '--keep-metadata', '-m', default=False, action='store_true',
-        help='Keep metadata of the original image. Default : False.')
+        '--keep-metadata', '-m', default=True, action='store_true',
+        help='Keep metadata of the original image. Default : True.')
     parser.add_argument('--help', '-h', action='help', help='Show this help message and exit.')
 
     args = parser.parse_args()

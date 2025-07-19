@@ -109,3 +109,4 @@ ENV/
 .vscode/
 
 deface/_version.py
+output/

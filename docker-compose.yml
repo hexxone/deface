@@ -1,8 +1,10 @@
-version: '3.8'
+name: deface
+
 services:
   deface:
+    container_name: deface
     build: .
     volumes:
-      - ./examples:/app/examples
+      - ./examples/original:/app/examples
       - ./output:/app/output
-    command: deface ./examples/city.mp4 -o ./output/city_anonymized.mp4
+    command: deface ./examples
