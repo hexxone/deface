@@ -37,20 +37,22 @@ class Track:
         self.kf.Q[-1, -1] *= 0.01
         self.kf.Q[4:, 4:] *= 0.01
 
-        self.kf.x[:4] = self.convert_bbox_to_z(bbox)
+        self.kf.x[:4] = Track.convert_bbox_to_z(bbox)
+        self.last_hit = bbox
         self.time_since_update = 0
         self.id = track_id
-        self.history = []
         self.hits = 0
         self.hit_streak = 0
+        self.best_hit_streak = 0
         self.age = 0
-        self.smoothing_buffer = []
+        self.last_hits_smoothing_buffer = [bbox]
+        self.predictions_smoothing_buffer = []
         self.smoothing_window = 5
         self.fade_in = 5
         self.fade_out = 5
-        self.alpha = 0
 
-    def convert_bbox_to_z(self, bbox):
+    @staticmethod
+    def convert_bbox_to_z(bbox):
         """
         Takes a bounding box in the form [x1,y1,x2,y2] and returns z in the form
         [x,y,s,r] where x,y is the centre of the box and s is the scale/area and r is
@@ -64,31 +66,61 @@ class Track:
         r = w / float(h)
         return np.array([x, y, s, r]).reshape((4, 1))
 
-    def convert_x_to_bbox(self, x, score=None):
+    @staticmethod
+    def convert_x_to_bbox(x):
         """
         Takes a bounding box in the centre form [x,y,s,r] and returns it in the form
         [x1,y1,x2,y2] where x1,y1 is the top-left and x2,y2 is the bottom-right
         """
         w = np.sqrt(x[2] * x[3])
         h = x[2] / w
-        if score is None:
-            return np.array([x[0] - w / 2., x[1] - h / 2., x[0] + w / 2., x[1] + h / 2.]).reshape((1, 4))
-        else:
-            return np.array([x[0] - w / 2., x[1] - h / 2., x[0] + w / 2., x[1] + h / 2., score]).reshape((1, 5))
+        return np.array([x[0] - w / 2., x[1] - h / 2., x[0] + w / 2., x[1] + h / 2.]).reshape((1, 4))
+
+    @property
+    def alpha(self):
+        if self.time_since_update > 0 and self.fade_out > 0:
+            return max(0, 1 - self.time_since_update / self.fade_out)
+        elif self.fade_in > 0:
+            return min(1, self.age / self.fade_in)
+        return 1
+
+    @property
+    def last_hit_bbox(self):
+        return np.concatenate((self.last_hit[:5], [self.alpha]), axis=None)
+
+    @property
+    def smoothed_hit_bbox(self):
+        bbox = (np.mean(self.last_hits_smoothing_buffer, axis=0)
+            if len(self.last_hits_smoothing_buffer) > 0
+            else self.last_hit)
+        return np.concatenate((bbox, [self.last_hit[4], self.alpha]), axis=None)
+
+    @property
+    def predicted_bbox(self):
+        bbox = (np.mean(self.predictions_smoothing_buffer, axis=0)
+            if len(self.predictions_smoothing_buffer) > 0
+            else Track.convert_x_to_bbox(self.kf.x))
+        return np.concatenate((bbox, [self.last_hit[4], self.alpha]), axis=None)
 
     def update(self, bbox):
         """
         Updates the state vector with observed bbox.
         """
         self.time_since_update = 0
-        self.history = []
         self.hits += 1
         self.hit_streak += 1
-        self.kf.update(self.convert_bbox_to_z(bbox))
+        self.best_hit_streak = max(self.best_hit_streak, self.hit_streak)
+
+        self.last_hit = bbox
+        self.kf.update(Track.convert_bbox_to_z(bbox))
+
+        self.last_hits_smoothing_buffer.append(bbox)
+        if len(self.last_hits_smoothing_buffer) > self.smoothing_window and self.smoothing_window > 1:
+            self.last_hits_smoothing_buffer.pop(0)
 
     def predict(self):
         """
-        Advances the state vector and returns the predicted bounding box estimate.
+        Advances the state vector and use the new predicted position.
         """
         if (self.kf.x[6] + self.kf.x[2]) <= 0:
             self.kf.x[6] *= 0.0
@@ -96,22 +128,13 @@ class Track:
         self.age += 1
         if self.time_since_update > 0:
             self.hit_streak = 0
+            self.last_hits_smoothing_buffer = []
         self.time_since_update += 1
 
-        if self.time_since_update > 0:
-            self.alpha = max(0, 1 - self.time_since_update / self.fade_out)
-        else:
-            self.alpha = min(1, self.age / self.fade_in)
-
-        bbox = self.convert_x_to_bbox(self.kf.x)
-        self.smoothing_buffer.append(bbox)
-        # Average over the last frames
-        if len(self.smoothing_buffer) > self.smoothing_window:
-            self.smoothing_buffer.pop(0)
-
-        smoothed_bbox = np.mean(self.smoothing_buffer, axis=0)
-        self.history.append(np.append(smoothed_bbox, self.alpha))
-        return self.history[-1]
+        bbox = Track.convert_x_to_bbox(self.kf.x)
+        self.predictions_smoothing_buffer.append(bbox)
+        if len(self.predictions_smoothing_buffer) > self.smoothing_window and self.smoothing_window > 1:
+            self.predictions_smoothing_buffer.pop(0)
 
 
 class Tracker:
@@ -135,19 +158,15 @@ class Tracker:
         returns a list of bounding boxes for the tracked objects.
         """
         self.frame_count += 1
-        # get predicted locations from existing trackers.
-        trks = np.zeros((len(self.trackers), 5))
+        # Predict locations from existing trackers.
         to_del = []
         ret = []
-        for t, trk in enumerate(trks):
-            pos = self.trackers[t].predict()
-            trk[:] = [pos[0], pos[1], pos[2], pos[3], 0]
-            if np.any(np.isnan(pos)):
-                to_del.append(t)
-        trks = np.ma.compress_rows(np.ma.masked_invalid(trks))
-        for t in reversed(to_del):
-            self.trackers.pop(t)
-        matched, unmatched_dets, unmatched_trks = self.associate_detections_to_trackers(dets, trks)
+        for t, trk in enumerate(reversed(self.trackers)):
+            trk.predict()
+            if np.any(np.isnan(trk.predicted_bbox)):
+                self.trackers.pop(t)
+
+        matched, unmatched_dets, unmatched_trks = self.associate_detections_to_trackers(dets, self.trackers)
 
         # update matched trackers with assigned detections
         for t, trk in enumerate(self.trackers):
@@ -164,17 +183,17 @@ class Tracker:
             trk.fade_out = self.fade_out
             self.trackers.append(trk)
         i = len(self.trackers)
+
+        # select trackers to display
         for trk in reversed(self.trackers):
-            d = trk.convert_x_to_bbox(trk.kf.x)[0]
-            if (trk.time_since_update < 1) and (trk.hit_streak >= self.min_hits or self.frame_count <= self.min_hits):
-                ret.append(np.concatenate((d, [trk.id + 1])).reshape(1, -1))  # +1 as MOT benchmark requires positive
+            if trk.time_since_update <= trk.fade_out and (trk.best_hit_streak >= self.min_hits or self.frame_count <= self.min_hits):
+                ret.append(trk)
             i -= 1
+
             # remove dead tracklet
             if trk.time_since_update > self.max_age:
                 self.trackers.pop(i)
-        if len(ret) > 0:
-            return np.concatenate(ret)
-        return np.empty((0, 5))
+        return ret
 
     def associate_detections_to_trackers(self, detections, trackers):
         """
@@ -187,18 +206,18 @@ class Tracker:
 
         for d, det in enumerate(detections):
             for t, trk in enumerate(trackers):
-                iou_matrix[d, t] = iou(det, trk)
+                iou_matrix[d, t] = max(iou(det, trk.last_hit_bbox), iou(det, trk.predicted_bbox))
 
         row_ind, col_ind = linear_sum_assignment(-iou_matrix)
         matched_indices = np.array(list(zip(row_ind, col_ind)))
 
         unmatched_detections = []
         for d, det in enumerate(detections):
-            if d not in matched_indices[:, 0]:
+            if not matched_indices.size or d not in matched_indices[:, 0]:
                 unmatched_detections.append(d)
         unmatched_trackers = []
         for t, trk in enumerate(trackers):
-            if t not in matched_indices[:, 1]:
+            if not matched_indices.size or t not in matched_indices[:, 1]:
                 unmatched_trackers.append(t)
 
         # filter out matched with low IOU

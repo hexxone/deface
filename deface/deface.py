@@ -44,27 +44,26 @@ def draw_det(
         cv2.rectangle(frame, (x1, y1), (x2, y2), ovcolor, -1)
     elif replacewith == 'blur':
         bf = 2  # blur factor (number of pixels in each dimension that the face will be reduced to)
-        blurred_box =  cv2.blur(
-            frame[y1:y2, x1:x2],
-            (abs(x2 - x1) // bf, abs(y2 - y1) // bf)
-        )
-        if ellipse:
-            roibox = frame[y1:y2, x1:x2]
-            # Get y and x coordinate lists of the "bounding ellipse"
-            ey, ex = skimage.draw.ellipse((y2 - y1) // 2, (x2 - x1) // 2, (y2 - y1) // 2, (x2 - x1) // 2)
 
-            # Create a feathered mask
-            mask = np.zeros_like(roibox, dtype=float)
-            mask[ey, ex] = 1.0
-            mask = cv2.GaussianBlur(mask, (0, 0), sigmaX=(x2 - x1) * feathering, sigmaY=(y2 - y1) * feathering)
+        if (alpha > 0 and y2 > y1 and x2 > x1):
+            blurred_box =  cv2.blur(
+                frame[y1:y2, x1:x2],
+                (max(1, int(alpha * abs(x2 - x1) // bf)), max(1, int(alpha * abs(y2 - y1) // bf)))
+            )
+            if ellipse:
+                roibox = frame[y1:y2, x1:x2]
+                # Get y and x coordinate lists of the "bounding ellipse"
+                ey, ex = skimage.draw.ellipse((y2 - y1) // 2, (x2 - x1) // 2, (y2 - y1) // 2, (x2 - x1) // 2)
 
-            # Apply alpha for fading
-            mask *= alpha
+                # Create a feathered mask
+                mask = np.zeros_like(roibox, dtype=float)
+                mask[ey, ex] = 1.0
+                mask = cv2.GaussianBlur(mask, (0, 0), sigmaX=(x2 - x1) * feathering, sigmaY=(y2 - y1) * feathering)
 
-            roibox = roibox * (1 - mask) + blurred_box * mask
-            frame[y1:y2, x1:x2] = roibox
-        else:
-            frame[y1:y2, x1:x2] = blurred_box
+                roibox = roibox * (1 - mask) + blurred_box * mask
+                frame[y1:y2, x1:x2] = roibox
+            else:
+                frame[y1:y2, x1:x2] = blurred_box
     elif replacewith == 'img':
         target_size = (x2 - x1, y2 - y1)
         resized_replaceimg = cv2.resize(replaceimg, target_size)
@@ -98,8 +97,11 @@ def anonymize_frame(
         x1, y1, x2, y2 = boxes.astype(int)
         x1, y1, x2, y2 = scale_bb(x1, y1, x2, y2, mask_scale)
         # Clip bb coordinates to valid frame region
-        y1, y2 = max(0, y1), min(frame.shape[0] - 1, y2)
-        x1, x2 = max(0, x1), min(frame.shape[1] - 1, x2)
+        y1 = max(0, min(frame.shape[0] - 1, y1))
+        y2 = max(0, min(frame.shape[0] - 1, y2))
+        x1 = max(0, min(frame.shape[1] - 1, x1))
+        x2 = max(0, min(frame.shape[1] - 1, x2))
+
         draw_det(
             frame, score, i, x1, y1, x2, y2,
             replacewith=replacewith,
@@ -137,6 +139,8 @@ def video_detect(
         unstable: bool = False,
         smoothing_window: int = 5,
         feathering: float = 0.1,
+        persist_last_pos: bool = False,
+        persist_with_tracking: bool = False,
         fade_in: int = 5,
         fade_out: int = 5,
         max_age: int = 30,
@@ -198,10 +202,21 @@ def video_detect(
             )
         else:
             # Update tracker
-            track_bbs_ids = tracker.update(dets)
+            trackers = tracker.update(dets)
+
+            bboxes = []
+            for trk in trackers:
+                if (trk.time_since_update <= 1):
+                    bboxes.append(trk.smoothed_hit_bbox)
+                else:
+                    if (persist_last_pos):
+                        bboxes.append(trk.smoothed_hit_bbox)
+                    if (persist_with_tracking):
+                        bboxes.append(trk.predicted_bbox)
+
             # Anonymize using tracked bbs
             anonymize_frame(
-                track_bbs_ids, frame, mask_scale=mask_scale,
+                bboxes, frame, mask_scale=mask_scale,
                 replacewith=replacewith, ellipse=ellipse, draw_scores=draw_scores,
                 replaceimg=replaceimg, mosaicsize=mosaicsize, feathering=feathering
             )
@@ -365,11 +380,17 @@ def parse_cli_args():
         '--unstable', default=False, action='store_true',
         help='Disable tracking and use unstable frame-by-frame detection.')
     parser.add_argument(
-        '--smoothing-window', default=5, type=int,
-        help='Size of the smoothing window for bounding box tracking. Default: 5.')
-    parser.add_argument(
         '--feathering', default=0.1, type=float,
         help='Feathering amount for smooth mask borders. Default: 0.1.')
+    parser.add_argument(
+        '--persist-last-pos', default=False, action='store_true',
+        help='Keep a mask when face is no longer detected, on the last known position.')
+    parser.add_argument(
+        '--persist-with-tracking', default=False, action='store_true',
+        help='Keep a mask when face is no longer detected, predicting its position with bounding box tracking.')
+    parser.add_argument(
+        '--smoothing-window', default=5, type=int,
+        help='Size of the smoothing window for bounding box tracking. Default: 5.')
     parser.add_argument(
         '--fade-in', default=5, type=int,
         help='Number of frames to fade in the mask. Default: 5.')
@@ -418,7 +439,7 @@ def main():
             # or an invalid path. The latter two cases are handled below.
             ipaths.append(path)
 
-    
+
     base_opath = args.output
     replacewith = args.replacewith
     enable_preview = args.preview
@@ -438,6 +459,8 @@ def main():
     unstable = args.unstable
     smoothing_window = args.smoothing_window
     feathering = args.feathering
+    persist_last_pos = args.persist_last_pos
+    persist_with_tracking = args.persist_with_tracking
     fade_in = args.fade_in
     fade_out = args.fade_out
     max_age = args.max_age
@@ -498,6 +521,8 @@ def main():
                 unstable=unstable,
                 smoothing_window=smoothing_window,
                 feathering=feathering,
+                persist_last_pos=persist_last_pos,
+                persist_with_tracking=persist_with_tracking,
                 fade_in=fade_in,
                 fade_out=fade_out,
                 max_age=max_age,
