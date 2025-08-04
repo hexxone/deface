@@ -40,37 +40,41 @@ def draw_det(
         feathering: float = 0.1,
         alpha: float = 1.0
 ):
+    h, w = y2 - y1, x2 - x1
+    if (w <= 0 or h <= 0): return
+
     if replacewith == 'solid':
         cv2.rectangle(frame, (x1, y1), (x2, y2), ovcolor, -1)
-    elif replacewith == 'blur':
+    elif replacewith == 'blur' and alpha > 0:
         bf = 2  # blur factor (number of pixels in each dimension that the face will be reduced to)
 
-        if (alpha > 0 and y2 > y1 and x2 > x1):
-            blurred_box =  cv2.blur(
-                frame[y1:y2, x1:x2],
-                (max(1, int(alpha * abs(x2 - x1) // bf)), max(1, int(alpha * abs(y2 - y1) // bf)))
-            )
-            if ellipse:
-                roibox = frame[y1:y2, x1:x2]
-                # Get y and x coordinate lists of the "bounding ellipse"
-                ey, ex = skimage.draw.ellipse((y2 - y1) // 2, (x2 - x1) // 2, (y2 - y1) // 2, (x2 - x1) // 2)
+        blurred_box =  cv2.blur(
+            frame[y1:y2, x1:x2],
+            (max(1, int(alpha * w // bf)), max(1, int(alpha * h // bf)))
+        )
+        if ellipse and h >= 2 and w >= 2:
+            roibox = frame[y1:y2, x1:x2]
+            # Get y and x coordinate lists of the "bounding ellipse"
+            ey, ex = skimage.draw.ellipse(h // 2, w // 2, h // 2, w // 2)
 
-                # Create a feathered mask
-                mask = np.zeros_like(roibox, dtype=float)
-                mask[ey, ex] = 1.0
-                mask = cv2.GaussianBlur(mask, (0, 0), sigmaX=(x2 - x1) * feathering, sigmaY=(y2 - y1) * feathering)
+            # Create a feathered mask
+            mask = np.zeros_like(roibox, dtype=float)
+            mask[ey, ex] = 1.0
+            mask = cv2.GaussianBlur(mask, (0, 0), sigmaX=w * feathering, sigmaY=h * feathering)
 
-                roibox = roibox * (1 - mask) + blurred_box * mask
-                frame[y1:y2, x1:x2] = roibox
-            else:
-                frame[y1:y2, x1:x2] = blurred_box
+            roibox = roibox * (1 - mask) + blurred_box * mask
+            frame[y1:y2, x1:x2] = roibox
+        else:
+            frame[y1:y2, x1:x2] = blurred_box
+
     elif replacewith == 'img':
-        target_size = (x2 - x1, y2 - y1)
+        target_size = (w, h)
         resized_replaceimg = cv2.resize(replaceimg, target_size)
         if replaceimg.shape[2] == 3:  # RGB
             frame[y1:y2, x1:x2] = resized_replaceimg
         elif replaceimg.shape[2] == 4:  # RGBA
             frame[y1:y2, x1:x2] = frame[y1:y2, x1:x2] * (1 - resized_replaceimg[:, :, 3:] / 255) + resized_replaceimg[:, :, :3] * (resized_replaceimg[:, :, 3:] / 255)
+
     elif replacewith == 'mosaic':
         for y in range(y1, y2, mosaicsize):
             for x in range(x1, x2, mosaicsize):
@@ -78,8 +82,10 @@ def draw_det(
                 pt2 = (min(x2, x + mosaicsize - 1), min(y2, y + mosaicsize - 1))
                 color = (int(frame[y, x][0]), int(frame[y, x][1]), int(frame[y, x][2]))
                 cv2.rectangle(frame, pt1, pt2, color, -1)
+
     elif replacewith == 'none':
         pass
+
     if draw_scores:
         cv2.putText(
             frame, f'{score:.2f}', (x1 + 0, y1 - 20),
@@ -489,6 +495,7 @@ def main():
             enable_preview = True
         filetype = get_file_type(ipath)
         is_cam = filetype == 'cam'
+
         if opath is None and not is_cam:
             root, ext = os.path.splitext(ipath)
             opath = f'{root}_anonymized{ext}'
