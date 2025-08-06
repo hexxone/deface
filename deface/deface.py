@@ -13,6 +13,7 @@ import imageio
 import imageio.v2 as iio
 import imageio.plugins.ffmpeg
 import cv2
+import re
 
 from deface import __version__
 from deface.centerface import CenterFace
@@ -288,19 +289,57 @@ def image_detect(
     # print(f'Output saved to {opath}')
 
 
-def get_file_type(path):
+#  https://gist.github.com/bthaman/64b20ef47b2364b16c2c6bc529b1d451
+def get_download_path():
+    """Returns the default downloads path for linux, windows and macos"""
+    if os.name == 'nt':
+        import winreg
+        sub_key = r'SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders'
+        downloads_guid = '{374DE290-123F-4565-9164-39C4925E467B}'
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, sub_key) as key:
+            location = winreg.QueryValueEx(key, downloads_guid)[0]
+        return location
+    else:
+        return os.path.join(os.path.expanduser('~'), 'downloads')
+
+
+def get_path_infos(path):
+    url_pattern = "^https?:\\/\\/(?:www\\.)?[-a-zA-Z0-9@:%._\\+~#=]{1,256}(?:\\.[a-zA-Z0-9()]{1,6})?\\b(?:[-a-zA-Z0-9()@:%_\\+.~#?&\\/=]*)$"
+    path_type = None
+    media_type = None
+    path_base = None
+    path_filename = None
+    path_ext = None
+
     if path.startswith('<video'):
-        return 'cam'
-    if not os.path.isfile(path):
-        return 'notfound'
+        path_type = 'cam'
+        media_type = 'video'
+    elif re.match(url_pattern, path):
+        path_type = 'url'
+        path = re.split('[?#]', path)[0]
+    elif os.path.isfile(path):
+        path_type = 'file'
+    elif os.path.isdir(path):
+        path_type = 'dir'
+
+    if path_type == 'dir':
+        path_base = path
+    else:
+        path_base = os.path.dirname(path)
+        path_filename, path_ext = os.path.splitext(os.path.basename(path))
+
+    if path_type == None and not path_ext:
+        path_base = path
+        path_filename = None
+
     mime = mimetypes.guess_type(path)[0]
-    if mime is None:
-        return None
-    if mime.startswith('video'):
-        return 'video'
-    if mime.startswith('image'):
-        return 'image'
-    return mime
+    if mime is not None:
+        if mime.startswith('video'):
+            media_type = 'video'
+        elif mime.startswith('image'):
+            media_type = 'image'
+
+    return (path_type, media_type, path_base, path_filename, path_ext, mime)
 
 
 def get_anonymized_image(frame,
@@ -332,10 +371,10 @@ def parse_cli_args():
     parser = argparse.ArgumentParser(description='Video anonymization by face detection', add_help=False)
     parser.add_argument(
         'input', nargs='*',
-        help=f'File path(s) or camera device name. It is possible to pass multiple paths by separating them by spaces or by using shell expansion (e.g. `$ deface vids/*.mp4`). Alternatively, you can pass a directory as an input, in which case all files in the directory will be used as inputs. If a camera is installed, a live webcam demo can be started by running `$ deface cam` (which is a shortcut for `$ deface -p \'<video0>\'`.')
+        help=f'File path(s), url(s) or camera device name. It is possible to pass multiple paths by separating them by spaces or by using shell expansion (e.g. `$ deface vids/*.mp4`). Alternatively, you can pass a directory as an input, in which case all files in the directory will be used as inputs. If a camera is installed, a live webcam demo can be started by running `$ deface cam` (which is a shortcut for `$ deface -p \'<video0>\'`.')
     parser.add_argument(
         '--output', '-o', default=None, metavar='O',
-        help='Output file name. Defaults to input path + postfix "_anonymized".')
+        help='Output file name. Defaults to input path with postfix "_anonymized". If input is a camera or url, defaults to the system downloads folder.')
     parser.add_argument(
         '--thresh', '-t', default=0.2, type=float, metavar='T',
         help='Detection threshold (tune this to trade off between false positive and false negative rate). Default: 0.2.')
@@ -493,27 +532,30 @@ def main():
         if ipath == 'cam':
             ipath = '<video0>'
             enable_preview = True
-        filetype = get_file_type(ipath)
-        is_cam = filetype == 'cam'
 
-        if opath is None and not is_cam:
-            root, ext = os.path.splitext(ipath)
-            opath = f'{root}_anonymized{ext}'
-        elif opath is not None and os.path.isdir(opath):
-            os.makedirs(opath, exist_ok=True)
-            root, ext = os.path.splitext(os.path.basename(ipath))
-            opath = os.path.join(opath, f'{root}_anonymized{ext}')
+        path_type, media_type, path_base, path_filename, path_ext, _ = get_path_infos(ipath)
+
+        if base_opath is None:
+            if path_type != 'file':
+                path_base = get_download_path()
+            opath = os.path.join(path_base, f'{path_filename}_anonymized{path_ext}')
+        else:
+            opath_type, _, opath_base, opath_filename, _, _ = get_path_infos(base_opath)
+            if opath_type is None:
+                os.makedirs(opath_base, exist_ok=True)
+            if opath_filename is None:
+                opath = os.path.join(opath_base, f'{path_filename}_anonymized{path_ext}')
 
         print(f'Input:  {ipath}\nOutput: {opath}')
         if opath is None and not enable_preview:
             print('No output file is specified and the preview GUI is disabled. No output will be produced.')
-        if filetype == 'video' or is_cam:
+        if media_type == 'video' or path_type == 'cam':
             video_detect(
                 ipath=ipath,
                 opath=opath,
                 centerface=centerface,
                 threshold=threshold,
-                cam=is_cam,
+                cam=(path_type == 'cam'),
                 replacewith=replacewith,
                 mask_scale=mask_scale,
                 ellipse=ellipse,
@@ -536,7 +578,7 @@ def main():
                 min_hits=min_hits,
                 iou_threshold=iou_threshold
             )
-        elif filetype == 'image':
+        elif media_type == 'image':
             image_detect(
                 ipath=ipath,
                 opath=opath,
@@ -552,12 +594,12 @@ def main():
                 mosaicsize=mosaicsize,
                 feathering=feathering
             )
-        elif filetype is None:
+        elif media_type is None:
             print(f'Can\'t determine file type of file {ipath}. Skipping...')
-        elif filetype == 'notfound':
+        elif media_type == 'notfound':
             print(f'File {ipath} not found. Skipping...')
         else:
-            print(f'File {ipath} has an unknown type {filetype}. Skipping...')
+            print(f'File {ipath} has an unknown type {media_type}. Skipping...')
 
 
 if __name__ == '__main__':
