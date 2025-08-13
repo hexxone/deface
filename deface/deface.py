@@ -535,7 +535,7 @@ def main():
             opath = os.path.join(path_base, f'{path_filename}_anonymized{path_ext}')
         else:
             opath_type, _, opath_base, opath_filename, _, _ = get_path_infos(base_opath)
-            if opath_type is None and opath_base.length:
+            if opath_type is None and len(opath_base) > 0:
                 os.makedirs(opath_base, exist_ok=True)
             if opath_filename is None:
                 opath = os.path.join(opath_base, f'{path_filename}_anonymized{path_ext}')
