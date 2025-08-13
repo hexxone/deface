@@ -9,9 +9,7 @@ from typing import Dict, Tuple
 import tqdm
 import skimage.draw
 import numpy as np
-import imageio
-import imageio.v2 as iio
-import imageio.plugins.ffmpeg
+import imageio.v3 as iio
 import cv2
 import re
 
@@ -155,26 +153,18 @@ def video_detect(
         iou_threshold: float = 0.5
 ):
     try:
-        if 'fps' in ffmpeg_config:
-            reader: imageio.plugins.ffmpeg.FfmpegFormat.Reader = imageio.get_reader(ipath, fps=ffmpeg_config['fps'])
-        else:
-            reader: imageio.plugins.ffmpeg.FfmpegFormat.Reader = imageio.get_reader(ipath)
-
-        meta = reader.get_meta_data()
-        _ = meta['size']
-    except:
+        meta = iio.immeta(ipath, plugin='pyav')
+    except Exception as error:
         if cam:
-            print(f'Could not find video device {ipath}. Please set a valid input.')
+            print(f'Could not find video device {ipath}: {error}. Please set a valid input.')
         else:
-            print(f'Could not open file {ipath} as a video file with imageio. Skipping file...')
+            print(f'Could not open file {ipath} as a video file with imageio: {error}. Skipping file...')
         return
 
     if cam:
         nframes = None
-        read_iter = cam_read_iter(reader)
     else:
-        read_iter = reader.iter_data()
-        nframes = reader.count_frames()
+        nframes = iio.improps(ipath, plugin='pyav').shape[0]
     if nested:
         bar = tqdm.tqdm(dynamic_ncols=True, total=nframes, position=1, leave=True, disable=disable_progress_output)
     else:
@@ -182,22 +172,25 @@ def video_detect(
 
     if opath is not None:
         _ffmpeg_config = ffmpeg_config.copy()
-        #  If fps is not explicitly set in ffmpeg_config, use source video fps value
-        _ffmpeg_config.setdefault('fps', meta['fps'])
+        # If fps is not explicitly set in ffmpeg_config, use source video fps value
+        # https://github.com/imageio/imageio/issues/1120
+        approximate_fps = round(meta['fps'], 1)
+        _ffmpeg_config.setdefault('fps', approximate_fps)
         # Carry over audio from input path, use "copy" codec (no transcoding) by default
         if keep_audio and meta.get('audio_codec'):
             _ffmpeg_config.setdefault('audio_path', ipath)
             _ffmpeg_config.setdefault('audio_codec', 'copy')
-        writer: imageio.plugins.ffmpeg.FfmpegFormat.Writer = imageio.get_writer(
-            opath, format='FFMPEG', mode='I', **_ffmpeg_config
-        )
+        writer = iio.imopen(opath, 'w', plugin='pyav')
+        writer.init_video_stream(**_ffmpeg_config)
+        # Workaround for https://github.com/imageio/imageio/issues/1139
+        writer._container.streams.video[0].codec_context.time_base = writer._container.streams.video[0].time_base
 
     tracker = Tracker(
         max_age=max_age, min_hits=min_hits, iou_threshold=iou_threshold,
         smoothing_window=smoothing_window,
         fade_in=fade_in, fade_out=fade_out
     )
-    for frame in read_iter:
+    for frame in iio.imiter(ipath, plugin='pyav'):
         # Perform network inference, get bb dets but discard landmark predictions
         dets, _ = centerface(frame, threshold=threshold)
 
@@ -230,7 +223,7 @@ def video_detect(
 
 
         if opath is not None:
-            writer.append_data(frame)
+            writer.write_frame(frame)
 
         if enable_preview:
             cv2.imshow('Preview of anonymization results (quit by pressing Q or Escape)', frame[:, :, ::-1])  # RGB -> RGB
@@ -238,7 +231,7 @@ def video_detect(
                 cv2.destroyAllWindows()
                 break
         bar.update()
-    reader.close()
+
     if opath is not None:
         writer.close()
     bar.close()
@@ -263,7 +256,7 @@ def image_detect(
 
     if keep_metadata:
         # Source image EXIF metadata retrieval via imageio V3 lib
-        metadata = imageio.v3.immeta(ipath)
+        metadata = iio.immeta(ipath)
         exif_dict = metadata.get("exif", None)
 
     # Perform network inference, get bb dets but discard landmark predictions
@@ -280,11 +273,12 @@ def image_detect(
         if cv2.waitKey(0) & 0xFF in [ord('q'), 27]:  # 27 is the escape key code
             cv2.destroyAllWindows()
 
-    imageio.imsave(opath, frame)
 
     if keep_metadata:
         # Save image with EXIF metadata
-        imageio.imsave(opath, frame, exif=exif_dict)
+        iio.imwrite(opath, frame, exif=exif_dict)
+    else:
+        iio.imwrite(opath, frame)
 
     # print(f'Output saved to {opath}')
 
@@ -516,7 +510,7 @@ def main():
         w, h = in_shape.split('x')
         in_shape = int(w), int(h)
     if replacewith == "img":
-        replaceimg = imageio.imread(args.replaceimg)
+        replaceimg = iio.imread(args.replaceimg)
         print(f'After opening {args.replaceimg} shape: {replaceimg.shape}')
 
 
@@ -541,7 +535,7 @@ def main():
             opath = os.path.join(path_base, f'{path_filename}_anonymized{path_ext}')
         else:
             opath_type, _, opath_base, opath_filename, _, _ = get_path_infos(base_opath)
-            if opath_type is None:
+            if opath_type is None and opath_base.length:
                 os.makedirs(opath_base, exist_ok=True)
             if opath_filename is None:
                 opath = os.path.join(opath_base, f'{path_filename}_anonymized{path_ext}')
