@@ -9,10 +9,10 @@ from typing import Dict, Tuple
 import tqdm
 import skimage.draw
 import numpy as np
-import imageio
-import imageio.v2 as iio
-import imageio.plugins.ffmpeg
+import imageio.v3 as iio
+import av
 import cv2
+import re
 
 from deface import __version__
 from deface.centerface import CenterFace
@@ -40,38 +40,41 @@ def draw_det(
         feathering: float = 0.1,
         alpha: float = 1.0
 ):
+    h, w = y2 - y1, x2 - x1
+    if (w <= 0 or h <= 0): return
+
     if replacewith == 'solid':
         cv2.rectangle(frame, (x1, y1), (x2, y2), ovcolor, -1)
-    elif replacewith == 'blur':
+    elif replacewith == 'blur' and alpha > 0:
         bf = 2  # blur factor (number of pixels in each dimension that the face will be reduced to)
+
         blurred_box =  cv2.blur(
             frame[y1:y2, x1:x2],
-            (abs(x2 - x1) // bf, abs(y2 - y1) // bf)
+            (max(1, int(alpha * w // bf)), max(1, int(alpha * h // bf)))
         )
-        if ellipse:
+        if ellipse and h >= 2 and w >= 2:
             roibox = frame[y1:y2, x1:x2]
             # Get y and x coordinate lists of the "bounding ellipse"
-            ey, ex = skimage.draw.ellipse((y2 - y1) // 2, (x2 - x1) // 2, (y2 - y1) // 2, (x2 - x1) // 2)
+            ey, ex = skimage.draw.ellipse(h // 2, w // 2, h // 2, w // 2)
 
             # Create a feathered mask
             mask = np.zeros_like(roibox, dtype=float)
             mask[ey, ex] = 1.0
-            mask = cv2.GaussianBlur(mask, (0, 0), sigmaX=(x2 - x1) * feathering, sigmaY=(y2 - y1) * feathering)
-
-            # Apply alpha for fading
-            mask *= alpha
+            mask = cv2.GaussianBlur(mask, (0, 0), sigmaX=w * feathering, sigmaY=h * feathering)
 
             roibox = roibox * (1 - mask) + blurred_box * mask
             frame[y1:y2, x1:x2] = roibox
         else:
             frame[y1:y2, x1:x2] = blurred_box
+
     elif replacewith == 'img':
-        target_size = (x2 - x1, y2 - y1)
+        target_size = (w, h)
         resized_replaceimg = cv2.resize(replaceimg, target_size)
         if replaceimg.shape[2] == 3:  # RGB
             frame[y1:y2, x1:x2] = resized_replaceimg
         elif replaceimg.shape[2] == 4:  # RGBA
             frame[y1:y2, x1:x2] = frame[y1:y2, x1:x2] * (1 - resized_replaceimg[:, :, 3:] / 255) + resized_replaceimg[:, :, :3] * (resized_replaceimg[:, :, 3:] / 255)
+
     elif replacewith == 'mosaic':
         for y in range(y1, y2, mosaicsize):
             for x in range(x1, x2, mosaicsize):
@@ -79,8 +82,10 @@ def draw_det(
                 pt2 = (min(x2, x + mosaicsize - 1), min(y2, y + mosaicsize - 1))
                 color = (int(frame[y, x][0]), int(frame[y, x][1]), int(frame[y, x][2]))
                 cv2.rectangle(frame, pt1, pt2, color, -1)
+
     elif replacewith == 'none':
         pass
+
     if draw_scores:
         cv2.putText(
             frame, f'{score:.2f}', (x1 + 0, y1 - 20),
@@ -98,8 +103,11 @@ def anonymize_frame(
         x1, y1, x2, y2 = boxes.astype(int)
         x1, y1, x2, y2 = scale_bb(x1, y1, x2, y2, mask_scale)
         # Clip bb coordinates to valid frame region
-        y1, y2 = max(0, y1), min(frame.shape[0] - 1, y2)
-        x1, x2 = max(0, x1), min(frame.shape[1] - 1, x2)
+        y1 = max(0, min(frame.shape[0] - 1, y1))
+        y2 = max(0, min(frame.shape[0] - 1, y2))
+        x1 = max(0, min(frame.shape[1] - 1, x1))
+        x2 = max(0, min(frame.shape[1] - 1, x2))
+
         draw_det(
             frame, score, i, x1, y1, x2, y2,
             replacewith=replacewith,
@@ -132,11 +140,14 @@ def video_detect(
         ffmpeg_config: Dict[str, str],
         replaceimg = None,
         keep_audio: bool = False,
+        keep_metadata: bool = False,
         mosaicsize: int = 20,
         disable_progress_output = False,
         unstable: bool = False,
         smoothing_window: int = 5,
         feathering: float = 0.1,
+        persist_last_pos: bool = False,
+        persist_with_tracking: bool = False,
         fade_in: int = 5,
         fade_out: int = 5,
         max_age: int = 30,
@@ -144,81 +155,114 @@ def video_detect(
         iou_threshold: float = 0.5
 ):
     try:
-        if 'fps' in ffmpeg_config:
-            reader: imageio.plugins.ffmpeg.FfmpegFormat.Reader = imageio.get_reader(ipath, fps=ffmpeg_config['fps'])
-        else:
-            reader: imageio.plugins.ffmpeg.FfmpegFormat.Reader = imageio.get_reader(ipath)
-
-        meta = reader.get_meta_data()
-        _ = meta['size']
-    except:
+        # Input: open with imageio to support special device/cam names, then use
+        # the AV stream so we can handle remote videos without pre-downloading them.
+        ifile = iio.imopen(ipath, plugin='pyav', io_mode='r')
+        icontainer = ifile._container
+        ivideo = icontainer.streams.video[0]
+    except Exception as error:
         if cam:
-            print(f'Could not find video device {ipath}. Please set a valid input.')
+            print(f'Could not find video device {ipath}: {error}. Please set a valid input.')
         else:
-            print(f'Could not open file {ipath} as a video file with imageio. Skipping file...')
+            print(f'Could not open file {ipath} as a video file with imageio: {error}. Skipping file...')
         return
 
     if cam:
         nframes = None
-        read_iter = cam_read_iter(reader)
     else:
-        read_iter = reader.iter_data()
-        nframes = reader.count_frames()
+        nframes = iio.improps(ipath, plugin='pyav').shape[0]
     if nested:
         bar = tqdm.tqdm(dynamic_ncols=True, total=nframes, position=1, leave=True, disable=disable_progress_output)
     else:
         bar = tqdm.tqdm(dynamic_ncols=True, total=nframes, disable=disable_progress_output)
 
     if opath is not None:
-        _ffmpeg_config = ffmpeg_config.copy()
-        #  If fps is not explicitly set in ffmpeg_config, use source video fps value
-        _ffmpeg_config.setdefault('fps', meta['fps'])
-        # Carry over audio from input path, use "copy" codec (no transcoding) by default
-        if keep_audio and meta.get('audio_codec'):
-            _ffmpeg_config.setdefault('audio_path', ipath)
-            _ffmpeg_config.setdefault('audio_codec', 'copy')
-        writer: imageio.plugins.ffmpeg.FfmpegFormat.Writer = imageio.get_writer(
-            opath, format='FFMPEG', mode='I', **_ffmpeg_config
+        # Output, use AV directly. Imageio-pyav does not support audio streams
+        # and stream creation has some bugs:
+        # https://github.com/imageio/imageio/issues/1120
+        # https://github.com/imageio/imageio/issues/1139
+        ocontainer = av.open(opath, mode='w')
+        ovideo = ocontainer.add_stream(
+            ffmpeg_config['codec'] if 'codec' in ffmpeg_config else ivideo.codec.name,
+            rate=ffmpeg_config['fps'] if 'fps' in ffmpeg_config else ivideo.average_rate,
+            options=ffmpeg_config
         )
+        ovideo.pix_fmt = ivideo.pix_fmt
+        ovideo.width = ivideo.width
+        ovideo.height = ivideo.height
+        ovideo.bit_rate = ivideo.bit_rate
+        if (keep_metadata):
+            ovideo.metadata.update(ivideo.metadata)
+
+        others_streams_in_out_map = {}
+        for istream in icontainer.streams:
+            if istream.type != 'video' and (keep_audio or istream.type != 'audio'):
+                others_streams_in_out_map[istream] = ocontainer.add_stream_from_template(istream)
 
     tracker = Tracker(
         max_age=max_age, min_hits=min_hits, iou_threshold=iou_threshold,
         smoothing_window=smoothing_window,
         fade_in=fade_in, fade_out=fade_out
     )
-    for frame in read_iter:
-        # Perform network inference, get bb dets but discard landmark predictions
-        dets, _ = centerface(frame, threshold=threshold)
 
-        if unstable:
-            anonymize_frame(
-                dets, frame, mask_scale=mask_scale,
-                replacewith=replacewith, ellipse=ellipse, draw_scores=draw_scores,
-                replaceimg=replaceimg, mosaicsize=mosaicsize, feathering=feathering
-            )
-        else:
-            # Update tracker
-            track_bbs_ids = tracker.update(dets)
-            # Anonymize using tracked bbs
-            anonymize_frame(
-                track_bbs_ids, frame, mask_scale=mask_scale,
-                replacewith=replacewith, ellipse=ellipse, draw_scores=draw_scores,
-                replaceimg=replaceimg, mosaicsize=mosaicsize, feathering=feathering
-            )
+    for packet in icontainer.demux():
+        if packet.stream == ivideo:
+            for avframe in packet.decode():
+                frame = avframe.to_ndarray(format='rgb24')
 
+                dets, _ = centerface(frame, threshold=threshold)
 
-        if opath is not None:
-            writer.append_data(frame)
+                if unstable:
+                    anonymize_frame(
+                        dets, frame, mask_scale=mask_scale,
+                        replacewith=replacewith, ellipse=ellipse, draw_scores=draw_scores,
+                        replaceimg=replaceimg, mosaicsize=mosaicsize, feathering=feathering
+                    )
+                else:
+                    # Update tracker
+                    trackers = tracker.update(dets)
 
-        if enable_preview:
-            cv2.imshow('Preview of anonymization results (quit by pressing Q or Escape)', frame[:, :, ::-1])  # RGB -> RGB
-            if cv2.waitKey(1) & 0xFF in [ord('q'), 27]:  # 27 is the escape key code
-                cv2.destroyAllWindows()
-                break
-        bar.update()
-    reader.close()
+                    bboxes = []
+                    for trk in trackers:
+                        if (trk.time_since_update <= 1):
+                            bboxes.append(trk.smoothed_hit_bbox)
+                        else:
+                            if (persist_last_pos):
+                                bboxes.append(trk.smoothed_hit_bbox)
+                            if (persist_with_tracking):
+                                bboxes.append(trk.predicted_bbox)
+
+                    # Anonymize using tracked bbs
+                    anonymize_frame(
+                        bboxes, frame, mask_scale=mask_scale,
+                        replacewith=replacewith, ellipse=ellipse, draw_scores=draw_scores,
+                        replaceimg=replaceimg, mosaicsize=mosaicsize, feathering=feathering
+                    )
+
+                if opath is not None:
+                    new_avframe = av.VideoFrame.from_ndarray(frame, format='rgb24')
+                    new_avframe = new_avframe.reformat(width=ovideo.width, height=ovideo.height, format=ovideo.pix_fmt)
+                    for opacket in ovideo.encode(new_avframe):
+                        ocontainer.mux(opacket)
+
+                if enable_preview:
+                    cv2.imshow('Preview of anonymization results (quit by pressing Q or Escape)', frame[:, :, ::-1])  # RGB -> RGB
+                    if cv2.waitKey(1) & 0xFF in [ord('q'), 27]:  # 27 is the escape key code
+                        cv2.destroyAllWindows()
+                        break
+
+                bar.update()
+
+        elif keep_audio or packet.stream.type != 'audio':
+            packet.stream = others_streams_in_out_map[packet.stream]
+            ocontainer.mux(packet)
+
+    # Flush
     if opath is not None:
-        writer.close()
+        for opacket in ovideo.encode():
+            ocontainer.mux(opacket)
+        ocontainer.close()
+    ifile.close()
     bar.close()
 
 
@@ -241,7 +285,7 @@ def image_detect(
 
     if keep_metadata:
         # Source image EXIF metadata retrieval via imageio V3 lib
-        metadata = imageio.v3.immeta(ipath)
+        metadata = iio.immeta(ipath)
         exif_dict = metadata.get("exif", None)
 
     # Perform network inference, get bb dets but discard landmark predictions
@@ -258,28 +302,67 @@ def image_detect(
         if cv2.waitKey(0) & 0xFF in [ord('q'), 27]:  # 27 is the escape key code
             cv2.destroyAllWindows()
 
-    imageio.imsave(opath, frame)
 
     if keep_metadata:
         # Save image with EXIF metadata
-        imageio.imsave(opath, frame, exif=exif_dict)
+        iio.imwrite(opath, frame, exif=exif_dict)
+    else:
+        iio.imwrite(opath, frame)
 
     # print(f'Output saved to {opath}')
 
 
-def get_file_type(path):
+#  https://gist.github.com/bthaman/64b20ef47b2364b16c2c6bc529b1d451
+def get_download_path():
+    """Returns the default downloads path for linux, windows and macos"""
+    if os.name == 'nt':
+        import winreg
+        sub_key = r'SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders'
+        downloads_guid = '{374DE290-123F-4565-9164-39C4925E467B}'
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, sub_key) as key:
+            location = winreg.QueryValueEx(key, downloads_guid)[0]
+        return location
+    else:
+        return os.path.join(os.path.expanduser('~'), 'downloads')
+
+
+def get_path_infos(path):
+    url_pattern = "^https?:\\/\\/(?:www\\.)?[-a-zA-Z0-9@:%._\\+~#=]{1,256}(?:\\.[a-zA-Z0-9()]{1,6})?\\b(?:[-a-zA-Z0-9()@:%_\\+.~#?&\\/=]*)$"
+    path_type = None
+    media_type = None
+    path_base = None
+    path_filename = None
+    path_ext = None
+
     if path.startswith('<video'):
-        return 'cam'
-    if not os.path.isfile(path):
-        return 'notfound'
+        path_type = 'cam'
+        media_type = 'video'
+    elif re.match(url_pattern, path):
+        path_type = 'url'
+        path = re.split('[?#]', path)[0]
+    elif os.path.isfile(path):
+        path_type = 'file'
+    elif os.path.isdir(path):
+        path_type = 'dir'
+
+    if path_type == 'dir':
+        path_base = path
+    else:
+        path_base = os.path.dirname(path)
+        path_filename, path_ext = os.path.splitext(os.path.basename(path))
+
+    if path_type == None and not path_ext:
+        path_base = path
+        path_filename = None
+
     mime = mimetypes.guess_type(path)[0]
-    if mime is None:
-        return None
-    if mime.startswith('video'):
-        return 'video'
-    if mime.startswith('image'):
-        return 'image'
-    return mime
+    if mime is not None:
+        if mime.startswith('video'):
+            media_type = 'video'
+        elif mime.startswith('image'):
+            media_type = 'image'
+
+    return (path_type, media_type, path_base, path_filename, path_ext, mime)
 
 
 def get_anonymized_image(frame,
@@ -311,10 +394,10 @@ def parse_cli_args():
     parser = argparse.ArgumentParser(description='Video anonymization by face detection', add_help=False)
     parser.add_argument(
         'input', nargs='*',
-        help=f'File path(s) or camera device name. It is possible to pass multiple paths by separating them by spaces or by using shell expansion (e.g. `$ deface vids/*.mp4`). Alternatively, you can pass a directory as an input, in which case all files in the directory will be used as inputs. If a camera is installed, a live webcam demo can be started by running `$ deface cam` (which is a shortcut for `$ deface -p \'<video0>\'`.')
+        help=f'File path(s), url(s) or camera device name. It is possible to pass multiple paths by separating them by spaces or by using shell expansion (e.g. `$ deface vids/*.mp4`). Alternatively, you can pass a directory as an input, in which case all files in the directory will be used as inputs. If a camera is installed, a live webcam demo can be started by running `$ deface cam` (which is a shortcut for `$ deface -p \'<video0>\'`.')
     parser.add_argument(
         '--output', '-o', default=None, metavar='O',
-        help='Output file name. Defaults to input path + postfix "_anonymized".')
+        help='Output file name. Defaults to input path with postfix "_anonymized". If input is a camera or url, defaults to the system downloads folder.')
     parser.add_argument(
         '--thresh', '-t', default=0.2, type=float, metavar='T',
         help='Detection threshold (tune this to trade off between false positive and false negative rate). Default: 0.2.')
@@ -365,11 +448,17 @@ def parse_cli_args():
         '--unstable', default=False, action='store_true',
         help='Disable tracking and use unstable frame-by-frame detection.')
     parser.add_argument(
-        '--smoothing-window', default=5, type=int,
-        help='Size of the smoothing window for bounding box tracking. Default: 5.')
-    parser.add_argument(
         '--feathering', default=0.1, type=float,
         help='Feathering amount for smooth mask borders. Default: 0.1.')
+    parser.add_argument(
+        '--persist-last-pos', default=False, action='store_true',
+        help='Keep a mask when face is no longer detected, on the last known position.')
+    parser.add_argument(
+        '--persist-with-tracking', default=False, action='store_true',
+        help='Keep a mask when face is no longer detected, predicting its position with bounding box tracking.')
+    parser.add_argument(
+        '--smoothing-window', default=5, type=int,
+        help='Size of the smoothing window for bounding box tracking. Default: 5.')
     parser.add_argument(
         '--fade-in', default=5, type=int,
         help='Number of frames to fade in the mask. Default: 5.')
@@ -387,7 +476,7 @@ def parse_cli_args():
         help='IOU threshold for matching detections to tracks. Default: 0.5.')
     parser.add_argument(
         '--keep-metadata', '-m', default=True, action='store_true',
-        help='Keep metadata of the original image. Default : True.')
+        help='Keep metadata of the original image or video. Default : True.')
     parser.add_argument('--help', '-h', action='help', help='Show this help message and exit.')
 
     args = parser.parse_args()
@@ -418,7 +507,7 @@ def main():
             # or an invalid path. The latter two cases are handled below.
             ipaths.append(path)
 
-    
+
     base_opath = args.output
     replacewith = args.replacewith
     enable_preview = args.preview
@@ -438,6 +527,8 @@ def main():
     unstable = args.unstable
     smoothing_window = args.smoothing_window
     feathering = args.feathering
+    persist_last_pos = args.persist_last_pos
+    persist_with_tracking = args.persist_with_tracking
     fade_in = args.fade_in
     fade_out = args.fade_out
     max_age = args.max_age
@@ -448,7 +539,7 @@ def main():
         w, h = in_shape.split('x')
         in_shape = int(w), int(h)
     if replacewith == "img":
-        replaceimg = imageio.imread(args.replaceimg)
+        replaceimg = iio.imread(args.replaceimg)
         print(f'After opening {args.replaceimg} shape: {replaceimg.shape}')
 
 
@@ -464,26 +555,30 @@ def main():
         if ipath == 'cam':
             ipath = '<video0>'
             enable_preview = True
-        filetype = get_file_type(ipath)
-        is_cam = filetype == 'cam'
-        if opath is None and not is_cam:
-            root, ext = os.path.splitext(ipath)
-            opath = f'{root}_anonymized{ext}'
-        elif opath is not None and os.path.isdir(opath):
-            os.makedirs(opath, exist_ok=True)
-            root, ext = os.path.splitext(os.path.basename(ipath))
-            opath = os.path.join(opath, f'{root}_anonymized{ext}')
+
+        path_type, media_type, path_base, path_filename, path_ext, _ = get_path_infos(ipath)
+
+        if base_opath is None:
+            if path_type != 'file':
+                path_base = get_download_path()
+            opath = os.path.join(path_base, f'{path_filename}_anonymized{path_ext}')
+        else:
+            opath_type, _, opath_base, opath_filename, _, _ = get_path_infos(base_opath)
+            if opath_type is None and len(opath_base) > 0:
+                os.makedirs(opath_base, exist_ok=True)
+            if opath_filename is None:
+                opath = os.path.join(opath_base, f'{path_filename}_anonymized{path_ext}')
 
         print(f'Input:  {ipath}\nOutput: {opath}')
         if opath is None and not enable_preview:
             print('No output file is specified and the preview GUI is disabled. No output will be produced.')
-        if filetype == 'video' or is_cam:
+        if media_type == 'video' or path_type == 'cam':
             video_detect(
                 ipath=ipath,
                 opath=opath,
                 centerface=centerface,
                 threshold=threshold,
-                cam=is_cam,
+                cam=(path_type == 'cam'),
                 replacewith=replacewith,
                 mask_scale=mask_scale,
                 ellipse=ellipse,
@@ -491,6 +586,7 @@ def main():
                 enable_preview=enable_preview,
                 nested=multi_file,
                 keep_audio=keep_audio,
+                keep_metadata=keep_metadata,
                 ffmpeg_config=ffmpeg_config,
                 replaceimg=replaceimg,
                 mosaicsize=mosaicsize,
@@ -498,13 +594,15 @@ def main():
                 unstable=unstable,
                 smoothing_window=smoothing_window,
                 feathering=feathering,
+                persist_last_pos=persist_last_pos,
+                persist_with_tracking=persist_with_tracking,
                 fade_in=fade_in,
                 fade_out=fade_out,
                 max_age=max_age,
                 min_hits=min_hits,
                 iou_threshold=iou_threshold
             )
-        elif filetype == 'image':
+        elif media_type == 'image':
             image_detect(
                 ipath=ipath,
                 opath=opath,
@@ -520,12 +618,12 @@ def main():
                 mosaicsize=mosaicsize,
                 feathering=feathering
             )
-        elif filetype is None:
+        elif media_type is None:
             print(f'Can\'t determine file type of file {ipath}. Skipping...')
-        elif filetype == 'notfound':
+        elif media_type == 'notfound':
             print(f'File {ipath} not found. Skipping...')
         else:
-            print(f'File {ipath} has an unknown type {filetype}. Skipping...')
+            print(f'File {ipath} has an unknown type {media_type}. Skipping...')
 
 
 if __name__ == '__main__':
