@@ -10,6 +10,7 @@ import tqdm
 import skimage.draw
 import numpy as np
 import imageio.v3 as iio
+import av
 import cv2
 import re
 
@@ -139,6 +140,7 @@ def video_detect(
         ffmpeg_config: Dict[str, str],
         replaceimg = None,
         keep_audio: bool = False,
+        keep_metadata: bool = False,
         mosaicsize: int = 20,
         disable_progress_output = False,
         unstable: bool = False,
@@ -153,7 +155,11 @@ def video_detect(
         iou_threshold: float = 0.5
 ):
     try:
-        meta = iio.immeta(ipath, plugin='pyav')
+        # Input: open with imageio to support special device/cam names, then use
+        # the AV stream so we can handle remote videos without pre-downloading them.
+        ifile = iio.imopen(ipath, plugin='pyav', io_mode='r')
+        icontainer = ifile._container
+        ivideo = icontainer.streams.video[0]
     except Exception as error:
         if cam:
             print(f'Could not find video device {ipath}: {error}. Please set a valid input.')
@@ -171,69 +177,92 @@ def video_detect(
         bar = tqdm.tqdm(dynamic_ncols=True, total=nframes, disable=disable_progress_output)
 
     if opath is not None:
-        _ffmpeg_config = ffmpeg_config.copy()
-        # If fps is not explicitly set in ffmpeg_config, use source video fps value
+        # Output, use AV directly. Imageio-pyav does not support audio streams
+        # and stream creation has some bugs:
         # https://github.com/imageio/imageio/issues/1120
-        approximate_fps = round(meta['fps'], 1)
-        _ffmpeg_config.setdefault('fps', approximate_fps)
-        # Carry over audio from input path, use "copy" codec (no transcoding) by default
-        if keep_audio and meta.get('audio_codec'):
-            _ffmpeg_config.setdefault('audio_path', ipath)
-            _ffmpeg_config.setdefault('audio_codec', 'copy')
-        writer = iio.imopen(opath, 'w', plugin='pyav')
-        writer.init_video_stream(**_ffmpeg_config)
-        # Workaround for https://github.com/imageio/imageio/issues/1139
-        writer._container.streams.video[0].codec_context.time_base = writer._container.streams.video[0].time_base
+        # https://github.com/imageio/imageio/issues/1139
+        ocontainer = av.open(opath, mode='w')
+        ovideo = ocontainer.add_stream(
+            ffmpeg_config['codec'] if 'codec' in ffmpeg_config else ivideo.codec.name,
+            rate=ffmpeg_config['fps'] if 'fps' in ffmpeg_config else ivideo.average_rate,
+            options=ffmpeg_config
+        )
+        ovideo.pix_fmt = ivideo.pix_fmt
+        ovideo.width = ivideo.width
+        ovideo.height = ivideo.height
+        ovideo.bit_rate = ivideo.bit_rate
+        if (keep_metadata):
+            ovideo.metadata.update(ivideo.metadata)
+
+        others_streams_in_out_map = {}
+        for istream in icontainer.streams:
+            if istream.type != 'video' and (keep_audio or istream.type != 'audio'):
+                others_streams_in_out_map[istream] = ocontainer.add_stream_from_template(istream)
 
     tracker = Tracker(
         max_age=max_age, min_hits=min_hits, iou_threshold=iou_threshold,
         smoothing_window=smoothing_window,
         fade_in=fade_in, fade_out=fade_out
     )
-    for frame in iio.imiter(ipath, plugin='pyav'):
-        # Perform network inference, get bb dets but discard landmark predictions
-        dets, _ = centerface(frame, threshold=threshold)
 
-        if unstable:
-            anonymize_frame(
-                dets, frame, mask_scale=mask_scale,
-                replacewith=replacewith, ellipse=ellipse, draw_scores=draw_scores,
-                replaceimg=replaceimg, mosaicsize=mosaicsize, feathering=feathering
-            )
-        else:
-            # Update tracker
-            trackers = tracker.update(dets)
+    for packet in icontainer.demux():
+        if packet.stream == ivideo:
+            for avframe in packet.decode():
+                frame = avframe.to_ndarray(format='rgb24')
 
-            bboxes = []
-            for trk in trackers:
-                if (trk.time_since_update <= 1):
-                    bboxes.append(trk.smoothed_hit_bbox)
+                dets, _ = centerface(frame, threshold=threshold)
+
+                if unstable:
+                    anonymize_frame(
+                        dets, frame, mask_scale=mask_scale,
+                        replacewith=replacewith, ellipse=ellipse, draw_scores=draw_scores,
+                        replaceimg=replaceimg, mosaicsize=mosaicsize, feathering=feathering
+                    )
                 else:
-                    if (persist_last_pos):
-                        bboxes.append(trk.smoothed_hit_bbox)
-                    if (persist_with_tracking):
-                        bboxes.append(trk.predicted_bbox)
+                    # Update tracker
+                    trackers = tracker.update(dets)
 
-            # Anonymize using tracked bbs
-            anonymize_frame(
-                bboxes, frame, mask_scale=mask_scale,
-                replacewith=replacewith, ellipse=ellipse, draw_scores=draw_scores,
-                replaceimg=replaceimg, mosaicsize=mosaicsize, feathering=feathering
-            )
+                    bboxes = []
+                    for trk in trackers:
+                        if (trk.time_since_update <= 1):
+                            bboxes.append(trk.smoothed_hit_bbox)
+                        else:
+                            if (persist_last_pos):
+                                bboxes.append(trk.smoothed_hit_bbox)
+                            if (persist_with_tracking):
+                                bboxes.append(trk.predicted_bbox)
 
+                    # Anonymize using tracked bbs
+                    anonymize_frame(
+                        bboxes, frame, mask_scale=mask_scale,
+                        replacewith=replacewith, ellipse=ellipse, draw_scores=draw_scores,
+                        replaceimg=replaceimg, mosaicsize=mosaicsize, feathering=feathering
+                    )
 
-        if opath is not None:
-            writer.write_frame(frame)
+                if opath is not None:
+                    new_avframe = av.VideoFrame.from_ndarray(frame, format='rgb24')
+                    new_avframe = new_avframe.reformat(width=ovideo.width, height=ovideo.height, format=ovideo.pix_fmt)
+                    for opacket in ovideo.encode(new_avframe):
+                        ocontainer.mux(opacket)
 
-        if enable_preview:
-            cv2.imshow('Preview of anonymization results (quit by pressing Q or Escape)', frame[:, :, ::-1])  # RGB -> RGB
-            if cv2.waitKey(1) & 0xFF in [ord('q'), 27]:  # 27 is the escape key code
-                cv2.destroyAllWindows()
-                break
-        bar.update()
+                if enable_preview:
+                    cv2.imshow('Preview of anonymization results (quit by pressing Q or Escape)', frame[:, :, ::-1])  # RGB -> RGB
+                    if cv2.waitKey(1) & 0xFF in [ord('q'), 27]:  # 27 is the escape key code
+                        cv2.destroyAllWindows()
+                        break
 
+                bar.update()
+
+        elif keep_audio or packet.stream.type != 'audio':
+            packet.stream = others_streams_in_out_map[packet.stream]
+            ocontainer.mux(packet)
+
+    # Flush
     if opath is not None:
-        writer.close()
+        for opacket in ovideo.encode():
+            ocontainer.mux(opacket)
+        ocontainer.close()
+    ifile.close()
     bar.close()
 
 
@@ -447,7 +476,7 @@ def parse_cli_args():
         help='IOU threshold for matching detections to tracks. Default: 0.5.')
     parser.add_argument(
         '--keep-metadata', '-m', default=True, action='store_true',
-        help='Keep metadata of the original image. Default : True.')
+        help='Keep metadata of the original image or video. Default : True.')
     parser.add_argument('--help', '-h', action='help', help='Show this help message and exit.')
 
     args = parser.parse_args()
@@ -557,6 +586,7 @@ def main():
                 enable_preview=enable_preview,
                 nested=multi_file,
                 keep_audio=keep_audio,
+                keep_metadata=keep_metadata,
                 ffmpeg_config=ffmpeg_config,
                 replaceimg=replaceimg,
                 mosaicsize=mosaicsize,
